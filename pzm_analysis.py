@@ -7,7 +7,8 @@ For every measurement table (= one sine period at a given amplitude) it extracts
 
   Strain loop (S-E, main figure)
     Smax+  strain at the positive field maximum  (V = V+max)
-    Smax-  strain at the negative field maximum  (V = V-max)
+    Smax-  lowest strain on the negative-field side (bottom of the butterfly
+           dip); the strain exactly at V-max is kept as S_at_Vmax-
     Sr     remanent strain: strain where V crosses 0 on the way down
            (after V+max, before V-max)
     Spp    peak-to-peak strain (max - min over the whole loop)
@@ -164,7 +165,12 @@ def analyse_table(t, strain_ch="D1", pol_ch="P1", thickness_um=None, avg=0):
 
     imax, imin = int(np.argmax(V)), int(np.argmin(V))
     Smax_p, Emax_p = _value_at_extreme(E, S, imax, avg)
-    Smax_m, Emax_m = _value_at_extreme(E, S, imin, avg)
+    S_at_Vmin, Emax_m = _value_at_extreme(E, S, imin, avg)
+    # Smax-: lowest strain on the negative-field side (bottom of the butterfly
+    # dip). At low field this coincides with V-max; after switching it does not.
+    neg = np.where(E < 0)[0]
+    ineg = int(neg[np.nanargmin(S[neg])]) if len(neg) else imin
+    Smax_m, E_Smax_m = _value_at_extreme(E, S, ineg, avg)
     Ps_p, _ = _value_at_extreme(E, P, imax, avg)
     Ps_m, _ = _value_at_extreme(E, P, imin, avg)
 
@@ -190,6 +196,8 @@ def analyse_table(t, strain_ch="D1", pol_ch="P1", thickness_um=None, avg=0):
         "Emax-_kV_cm": Emax_m,
         "Smax+_%": Smax_p,
         "Smax-_%": Smax_m,
+        "E_at_Smax-_kV_cm": E_Smax_m,
+        "S_at_Vmax-_%": S_at_Vmin,
         "Sr_%": Sr,
         "S_end_%": S_end,
         "Spp_%": float(np.nanmax(S) - np.nanmin(S)),
@@ -284,7 +292,7 @@ def make_plots(stem, res, loops, outdir):
     ax.plot(np.r_[g["E_kV_cm"], g["E_kV_cm"].iloc[0]], np.r_[g["S_%"], g["S_%"].iloc[0]], color="navy")
     ax.axhline(0, color="grey", lw=0.6); ax.axvline(0, color="grey", lw=0.6)
     pts = [(r["Emax+_kV_cm"], r["Smax+_%"], "S$_{max}^+$"),
-           (r["Emax-_kV_cm"], r["Smax-_%"], "S$_{max}^-$"),
+           (r["E_at_Smax-_kV_cm"], r["Smax-_%"], "S$_{max}^-$"),
            (0.0, r["Sr_%"], "S$_r$")]
     for x, y, lab in pts:
         ax.plot(x, y, "o", color="crimson", zorder=5)
