@@ -27,6 +27,12 @@ Requires Python 3.8 or newer.
 python pzm_analysis.py  INPUT_FOLDER  OUTPUT_FOLDER  [options]
 ```
 
+e.g.
+
+```bash
+python pzm_analysis.py carpeta_dat carpeta_resultados
+```
+
 Example (Windows):
 
 ```bash
