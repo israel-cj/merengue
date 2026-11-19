@@ -24,7 +24,7 @@ nothing is hard-coded. E [kV/cm] = V / thickness ; S [%] = D / thickness * 100.
 
 Usage
 -----
-    python pzm_analysis.py  INPUT_FOLDER  OUTPUT_FOLDER  [options]
+    python pzm_analysis.py  INPUT_FOLDER_OR_FILE  OUTPUT_FOLDER  [options]
 
     options:
       --strain-channel D1     displacement column to use (D1, D2 or D3)
@@ -33,6 +33,11 @@ Usage
       --avg-points 0          average +-N points around V+max / V-max
       --no-plots              only write the CSV / Excel files
       --keep-broken           keep measurements with Measurement Status != 0
+      --slope-window -10 10   field window (kV/cm) for the slope of D [nm] vs V+ [V]
+      --slope-eapp all        which loops go in the slope table, by E_app:
+                              20 | 10:20 | >=15 | "10:15, 20" | all
+      --interactive           show the E_app values found and ask for the
+                              slope window and E_app condition
 
 Measurements with 'Measurement Status' != 0 are treated as broken: they are
 removed from the results and plots and written to broken_measurements*.csv
@@ -44,6 +49,9 @@ Outputs (in OUTPUT_FOLDER)
                                      (+ S_sum = |Smax+|+|Smax-| and Sr_ratio = Sr/S_sum)
     Sr_ratio_all_files.png           Sr_ratio vs X, and Sr vs S_sum with linear fits
     Sr_ratio_linear_fits.csv         slope, intercept, R2 of Sr vs S_sum per file
+    slopes_all_files.csv / .png      slope dD/dV (nm/V) in the field window, per loop meeting
+                                     the E_app condition (<file>/<file>_slopes.csv,
+                                     <file>/<file>_slope_check.png per file)
     broken_measurements_all_files.csv  measurements with Measurement Status != 0
     summary_all_files.csv / .xlsx    one row per table, all files together
     <file>/<file>_results.csv        same, for one file
@@ -162,7 +170,41 @@ def _value_at_extreme(v, y, idx, avg):
     return float(np.mean(y[lo:hi])), float(np.mean(v[lo:hi]))
 
 
-def analyse_table(t, strain_ch="D1", pol_ch="P1", thickness_um=None, avg=0):
+def _linfit(x, y):
+    """Least-squares line y = slope * x + icpt. Returns (slope, icpt, R2, n)."""
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if len(x) < 3 or np.ptp(x) == 0:
+        return np.nan, np.nan, np.nan, len(x)
+    slope, icpt = np.polyfit(x, y, 1)
+    ss = np.sum((y - y.mean()) ** 2)
+    r2 = 1 - np.sum((y - (slope * x + icpt)) ** 2) / ss if ss > 0 else np.nan
+    return float(slope), float(icpt), float(r2), len(x)
+
+
+def window_slopes(E, x, y, imax, imin, e_lo, e_hi):
+    """Slope dy/dx of a linear fit to the points with e_lo <= E <= e_hi (the
+    window is given in field, kV/cm), done separately on each half-cycle:
+        'down' = decreasing field, V+max -> V-max
+        'up'   = increasing field, V-max -> V+max (wraps through t = 0)
+    Used with x = V+ [V] and y = D [nm]  ->  slope in nm/V.
+    Returns {branch: (slope, icpt, R2, n, indices)}."""
+    N = len(E)
+    out = {}
+    for name, (a, b) in (("down", (imax, imin)), ("up", (imin, imax))):
+        idx = np.array([(a + k) % N for k in range(((b - a) % N) + 1)])
+        sel = idx[(E[idx] >= e_lo) & (E[idx] <= e_hi)]
+        out[name] = _linfit(x[sel], y[sel]) + (sel,)
+    return out
+
+
+# the loop must reach the window edges to within this fraction of the window
+# width (E at V+max is a sampled value, e.g. 9.98 kV/cm for E_app = 10 kV/cm)
+WINDOW_TOL = 0.01
+
+
+def analyse_table(t, strain_ch="D1", pol_ch="P1", thickness_um=None, avg=0,
+                  slope_window=(-10.0, 10.0)):
     meta, d = t["meta"], t["data"]
     th_nm = thickness_um * 1e3 if thickness_um else float(meta.get("Thickness [nm]", np.nan))
     th_cm = th_nm * 1e-7
@@ -191,6 +233,15 @@ def analyse_table(t, strain_ch="D1", pol_ch="P1", thickness_um=None, avg=0):
     S_end, _ = _zero_cross(V, S, imin, imax, +1)     # strain back at V=0
     Ec_m, _ = _zero_cross(P, E, imax, imin, -1)      # P falls through 0
     Ec_p, _ = _zero_cross(P, E, imin, imax, +1)      # P rises through 0
+
+    # slope dD/dV (raw V+ [V] vs D [nm], nm/V) for the points inside the field
+    # window [e_lo, e_hi] kV/cm  (= [e_lo, e_hi] * thickness in volts)
+    e_lo, e_hi = slope_window
+    ws = window_slopes(E, V, D, imax, imin, e_lo, e_hi)
+    tol = WINDOW_TOL * (e_hi - e_lo)
+    covered = bool(np.nanmax(E) >= e_hi - tol and np.nanmin(E) <= e_lo + tol)
+    sl_up, sl_dn = ws["up"][0], ws["down"][0]
+    sl_mean = np.nanmean([sl_up, sl_dn]) if np.isfinite([sl_up, sl_dn]).any() else np.nan
 
     return {
         "table": t["table"],
@@ -223,6 +274,21 @@ def analyse_table(t, strain_ch="D1", pol_ch="P1", thickness_um=None, avg=0):
         "Ec+_kV_cm": Ec_p,
         "Ec-_kV_cm": Ec_m,
         "d33*_pm_V": (Smax_p / 100) / (Emax_p * 1e5) * 1e12 if Emax_p else np.nan,
+        # slope of D [nm] vs V+ [V] for the points inside the field window
+        "slope_Elo_kV_cm": e_lo,
+        "slope_Ehi_kV_cm": e_hi,
+        "slope_Vlo_V": e_lo * 1e3 * th_cm,
+        "slope_Vhi_V": e_hi * 1e3 * th_cm,
+        "slope_window_covered": covered,
+        "slope_up_nm_per_V": sl_up,
+        "slope_down_nm_per_V": sl_dn,
+        "slope_mean_nm_per_V": sl_mean,
+        "slope_up_R2": ws["up"][2],
+        "slope_down_R2": ws["down"][2],
+        "slope_up_n": ws["up"][3],
+        "slope_down_n": ws["down"][3],
+        "slope_up_icpt_nm": ws["up"][1],
+        "slope_down_icpt_nm": ws["down"][1],
         # instrument values, for cross-checking
         "instr_Dvmax+_nm": meta.get("Dvmax+ [nm/V]", np.nan),
         "instr_Dvmax-_nm": meta.get("Dvmax- [nm/V]", np.nan),
@@ -269,6 +335,52 @@ def is_ok(res: pd.DataFrame) -> pd.Series:
 S_VS_X_COLS = ["file", "step", "table", "branch", "ramp", "amplitude_V",
                "X_kV_cm", "Sr_%", "Smax+_%", "Smax-_%", "E_at_Smax-_kV_cm",
                "S_sum_%", "Sr_ratio", "measurement_status"]
+
+# columns of the slope table (dD/dV, V+ [V] vs D [nm], inside the field window)
+SLOPE_COLS = ["file", "step", "table", "branch", "ramp", "amplitude_V", "X_kV_cm",
+              "thickness_um", "Emax+_kV_cm", "Emax-_kV_cm",
+              "slope_Elo_kV_cm", "slope_Ehi_kV_cm", "slope_Vlo_V", "slope_Vhi_V",
+              "slope_window_covered", "slope_up_nm_per_V", "slope_down_nm_per_V",
+              "slope_mean_nm_per_V", "slope_up_R2", "slope_down_R2",
+              "slope_up_n", "slope_down_n", "is_last_at_amplitude", "measurement_status"]
+
+EAPP_TOL = 0.05   # kV/cm, tolerance when matching E_app values (8.0000001 == 8)
+
+
+def parse_eapp_condition(spec):
+    """Turn a text condition on the applied field X = E_app (kV/cm) into a
+    function array -> bool mask. Accepted forms (combine with commas):
+        all | (empty)     every loop
+        20                E_app == 20 (within EAPP_TOL)
+        10:20  or 10-20   10 <= E_app <= 20
+        >=15, >15, <=12, <12
+    e.g. "10:15, 20"  ->  10 <= E_app <= 15  or  E_app == 20"""
+    spec = (spec or "").strip().lower()
+    if spec in ("", "all", "*"):
+        return lambda x: np.ones(len(x), bool)
+    tests = []
+    for part in (p.strip() for p in spec.split(",")):
+        if not part:
+            continue
+        m = re.fullmatch(r"(>=|<=|>|<)\s*([\d.]+)", part)
+        r = re.fullmatch(r"([\d.]+)\s*[:-]\s*([\d.]+)", part)
+        try:
+            if m:
+                op, v = m.group(1), float(m.group(2))
+                tests.append({">=": lambda x, v=v: x >= v - EAPP_TOL,
+                              "<=": lambda x, v=v: x <= v + EAPP_TOL,
+                              ">": lambda x, v=v: x > v + EAPP_TOL,
+                              "<": lambda x, v=v: x < v - EAPP_TOL}[op])
+            elif r:
+                lo, hi = sorted(map(float, r.groups()))
+                tests.append(lambda x, lo=lo, hi=hi: (x >= lo - EAPP_TOL) & (x <= hi + EAPP_TOL))
+            else:
+                v = float(part)
+                tests.append(lambda x, v=v: np.abs(x - v) <= EAPP_TOL)
+        except ValueError:
+            raise ValueError(f"cannot read E_app condition '{part}' "
+                             "(use e.g. 20, 10:20, >=15, or a comma list)") from None
+    return lambda x: np.logical_or.reduce([t(np.asarray(x, float)) for t in tests])
 
 
 # --------------------------------------------------------------------------
@@ -413,8 +525,9 @@ def plot_s_vs_x_all_files(df, outpath):
     fig.savefig(outpath, dpi=200); plt.close(fig)
 
 
-FILE_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
-FILE_MARKERS = ["o", "s", "^", "D", "v", "P"]
+FILE_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300",
+               "#7a4fb5", "#4d4d4d"]
+FILE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "h"]
 
 
 def linear_fits(df):
@@ -484,24 +597,109 @@ def plot_sr_ratio(df, fits, title, outpath):
     fig.tight_layout(); fig.savefig(outpath, dpi=200); plt.close(fig)
 
 
+def plot_slope_check(stem, row, loop, outpath=None, d_label="D1"):
+    """One raw D-V loop with the window shaded and the two fitted lines drawn
+    on top: visual check of the slope calculation. Returns the figure when
+    outpath is None (used by the Gradio app), otherwise saves it."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    v_lo, v_hi = row["slope_Vlo_V"], row["slope_Vhi_V"]
+    V, D = loop["V"].to_numpy(), loop["D_nm"].to_numpy()
+    fig, ax = plt.subplots(figsize=(6.5, 5))
+    ax.axvspan(v_lo, v_hi, color="#2a78d6", alpha=0.08, lw=0)
+    ax.plot(np.r_[V, V[0]], np.r_[D, D[0]], color="#888888", lw=1, label="D-V loop")
+    xx = np.array([v_lo, v_hi])
+    for br, colr, lab in [("up", "#eb6834", "increasing V"), ("down", "#1baf7a", "decreasing V")]:
+        m, b = row[f"slope_{br}_nm_per_V"], row[f"slope_{br}_icpt_nm"]
+        if np.isfinite(m):
+            ax.plot(xx, m * xx + b, color=colr, lw=2,
+                    label=f"{lab}: {m:.4f} nm/V, R$^2$ = {row[f'slope_{br}_R2']:.3f}")
+    ax.axhline(0, color="#bbbbbb", lw=0.6); ax.axvline(0, color="#bbbbbb", lw=0.6)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.set_xlabel("V+ (V)"); ax.set_ylabel(f"{d_label} (nm)")
+    ax.set_title(f"{stem} - table {int(row['table'])}, E$_{{app}}$ = {row['X_kV_cm']:.1f} kV/cm\n"
+                 f"fit in {row['slope_Elo_kV_cm']:g} ... {row['slope_Ehi_kV_cm']:g} kV/cm "
+                 f"= {v_lo:.0f} ... {v_hi:.0f} V (shaded), "
+                 f"mean {row['slope_mean_nm_per_V']:.4f} nm/V", fontsize=9)
+    ax.legend(fontsize=7.5, frameon=False, loc="upper left")
+    fig.tight_layout()
+    if outpath is None:
+        return fig
+    fig.savefig(outpath, dpi=200); plt.close(fig)
+
+
+def plot_slopes_all_files(df, outpath, e_lo, e_hi, condition):
+    """Mean slope dD/dV (nm/V) vs X, one colour per file. Points are joined in
+    measurement order; filled/solid = amplitude ramping up, open/dashed = down.
+    Returns the figure when outpath is None."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    df = df[df["is_last_at_amplitude"] & df["slope_window_covered"]]
+    if df.empty:
+        return None
+    files = list(dict.fromkeys(df["file"]))
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    for k, f in enumerate(files):
+        c, mk = FILE_COLORS[k % len(FILE_COLORS)], FILE_MARKERS[k % len(FILE_MARKERS)]
+        g = df[df["file"] == f].sort_values("step")
+        down = (g["ramp"] == "down").to_numpy()
+        run = np.r_[0, np.cumsum(down[1:] != down[:-1])]   # consecutive up / down runs
+        lab = Path(f).stem                                   # legend entry once per file
+        for k_run in np.unique(run):
+            idx = np.flatnonzero(run == k_run)
+            is_down = down[idx[0]]
+            line = np.r_[idx[0] - 1, idx] if idx[0] > 0 else idx   # join to previous run
+            ax.plot(g["X_kV_cm"].iloc[line], g["slope_mean_nm_per_V"].iloc[line],
+                    ls="--" if is_down else "-", lw=1.3, color=c, zorder=1)
+            ax.plot(g["X_kV_cm"].iloc[idx], g["slope_mean_nm_per_V"].iloc[idx], ls="none",
+                    marker=mk, ms=6, mfc="white" if is_down else c, mec=c, mew=1.3,
+                    zorder=2, label=lab)
+            lab = None
+    ax.grid(True, color="#e6e6e6", lw=0.6); ax.set_axisbelow(True)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.set_xlabel("X = applied electric field E$_{app}$ (kV/cm)")
+    ax.set_ylabel(f"dD/dV for E in [{e_lo:g}, {e_hi:g}] kV/cm  (nm/V)")
+    ax.set_title(f"Slope of D vs V+ between {e_lo:g} and {e_hi:g} kV/cm "
+                 f"(E$_{{app}}$ condition: {condition or 'all'})\n"
+                 "mean of both half-cycles; filled/solid = E$_{app}$ ramping up, "
+                 "open/dashed = down", fontsize=9)
+    ax.legend(fontsize=7.5, frameon=False)
+    fig.tight_layout()
+    if outpath is None:
+        return fig
+    fig.savefig(outpath, dpi=200); plt.close(fig)
+
+
 # --------------------------------------------------------------------------
 # 4. Driver
 # --------------------------------------------------------------------------
 
-def process_file(path, outroot, args):
-    stem = path.stem
+def analyse_file(path, strain_ch="D1", pol_ch="P1", thickness_um=None, avg=0,
+                 slope_window=(-10.0, 10.0), keep_broken=False, log=print):
+    """Parse and analyse one .dat file, without writing anything.
+    Returns (res, good, broken, loops, summary) or None if no tables.
+      res    all loops        good   loops kept (status == 0 unless keep_broken)
+      broken status != 0      loops  all loop points (long format)"""
+    path = Path(path)
     summary, tables = parse_pzm_file(path)
     if not tables:
-        print(f"  ! {path.name}: no measurement tables found, skipped")
         return None
     rows, loops = [], []
     for t in tables:
         try:
-            r, lp = analyse_table(t, args.strain_channel, args.pol_channel,
-                                  args.thickness_um, args.avg_points)
+            r, lp = analyse_table(t, strain_ch, pol_ch, thickness_um, avg,
+                                  slope_window=tuple(slope_window))
             rows.append(r); loops.append(lp)
         except Exception as e:  # keep going if one table is broken
-            print(f"  ! {path.name} table {t['table']}: {e}")
+            log(f"  ! {path.name} table {t['table']}: {e}")
+    if not rows:
+        return None
     res = label_sequence(pd.DataFrame(rows))
     res.insert(0, "file", path.name)
     res["X_kV_cm"] = res["Eapp_kV_cm"]          # X = applied electric field
@@ -513,13 +711,24 @@ def process_file(path, outroot, args):
     # --- split good / broken (Measurement Status != 0) ---
     ok = is_ok(res)
     broken = res[~ok].copy()
-    good = res if args.keep_broken else res[ok].copy()
-    good_loops = loops[loops["table"].isin(good["table"])]
-    broken_loops = loops[loops["table"].isin(broken["table"])]
-    if not args.keep_broken and len(good):
+    good = res.copy() if keep_broken else res[ok].copy()
+    if not keep_broken and len(good):
         # recompute "last loop at this amplitude" without the broken ones
         a = good["amplitude_V"].to_numpy()
         good["is_last_at_amplitude"] = a != np.r_[a[1:], np.nan]
+    return res, good, broken, loops, summary
+
+
+def process_file(path, outroot, args):
+    stem = path.stem
+    out = analyse_file(path, args.strain_channel, args.pol_channel, args.thickness_um,
+                       args.avg_points, tuple(args.slope_window), args.keep_broken)
+    if out is None:
+        print(f"  ! {path.name}: no measurement tables found, skipped")
+        return None
+    res, good, broken, loops, summary = out
+    good_loops = loops[loops["table"].isin(good["table"])]
+    broken_loops = loops[loops["table"].isin(broken["table"])]
 
     outdir = outroot / stem
     outdir.mkdir(parents=True, exist_ok=True)
@@ -536,15 +745,72 @@ def process_file(path, outroot, args):
         plot_s_vs_x(good, stem, outdir / f"{stem}_S_vs_X.png",
                     n_broken=0 if args.keep_broken else len(broken))
         plot_sr_ratio(good, linear_fits(good), stem, outdir / f"{stem}_Sr_ratio.png")
+    # slope table for the loops that meet the E_app condition
+    sel = good[args.eapp_test(good["X_kV_cm"].to_numpy())]
+    sel[SLOPE_COLS].to_csv(outdir / f"{stem}_slopes.csv", index=False)
+    usable = sel[sel["slope_window_covered"]]
+    if not args.no_plots and len(usable):
+        # check plot: the largest loop that meets the condition
+        r = usable.loc[usable["amplitude_V"].idxmax()]
+        plot_slope_check(stem, r, good_loops[good_loops["table"] == r["table"]],
+                         outdir / f"{stem}_slope_check.png", d_label=args.strain_channel)
     msg = f", {len(broken)} broken (status != 0)" if len(broken) else ""
     print(f"  {path.name}: {len(res)} loops{msg}, thickness {res['thickness_um'].iloc[0]:.0f} um, "
           f"Eapp {res['Eapp_kV_cm'].min():.1f}-{res['Eapp_kV_cm'].max():.1f} kV/cm")
     return good, broken
 
 
+def _ask(prompt, default):
+    """input() with a default; falls back to the default when there is no
+    console (e.g. stdin closed)."""
+    try:
+        ans = input(f"{prompt} [{default}]: ").strip().lstrip("\ufeff")
+    except EOFError:
+        ans = ""
+    return ans or str(default)
+
+
+def ask_slope_settings(files, args):
+    """--interactive: list the E_app values in the files, then ask for the
+    slope window and the E_app condition."""
+    print("\nApplied fields (E_app, kV/cm) found in the files:")
+    for f in files:
+        _, tables = parse_pzm_file(f)
+        vals = []
+        for t in tables:
+            th = args.thickness_um * 1e3 if args.thickness_um else t["meta"].get("Thickness [nm]")
+            amp = t["meta"].get("Hysteresis Amplitude [V]")
+            if isinstance(th, float) and isinstance(amp, float) and th:
+                vals.append(round(amp / (th * 1e-7) / 1e3, 1))
+        print(f"  {f.stem}: {', '.join(f'{v:g}' for v in sorted(set(vals)))}")
+    lo_d, hi_d = args.slope_window
+    while True:
+        try:
+            lo = float(_ask("\nLower edge of the slope window E (kV/cm)", f"{lo_d:g}"))
+            hi = float(_ask("Upper edge of the slope window E (kV/cm)", f"{hi_d:g}"))
+            if lo >= hi:
+                raise ValueError("the lower edge must be below the upper edge")
+            break
+        except ValueError as e:
+            print(f"  ! {e}, try again")
+    args.slope_window = [lo, hi]
+    print("Which loops? Condition on E_app, e.g.  20  |  10:20  |  >=15  |  10:15, 20  |  all")
+    print(f"  (only loops that reach both {lo:g} and {hi:g} kV/cm give a full-window slope)")
+    while True:
+        spec = _ask("E_app condition", args.slope_eapp or "all")
+        try:
+            args.eapp_test = parse_eapp_condition(spec)
+            args.slope_eapp = spec
+            break
+        except ValueError as e:
+            print(f"  ! {e}")
+    print()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("input_folder", type=Path)
+    ap.add_argument("input_folder", type=Path,
+                    help="folder with .dat files, or a single .dat file")
     ap.add_argument("output_folder", type=Path)
     ap.add_argument("--strain-channel", default="D1", choices=["D1", "D2", "D3"])
     ap.add_argument("--pol-channel", default="P1", choices=["P1", "P2", "P3"])
@@ -554,11 +820,36 @@ def main(argv=None):
     ap.add_argument("--keep-broken", action="store_true",
                     help="keep measurements with Measurement Status != 0 in the results "
                          "(they are still listed in the broken_measurements CSV)")
+    ap.add_argument("--slope-window", nargs=2, type=float, default=[-10.0, 10.0],
+                    metavar=("E_LO", "E_HI"),
+                    help="field window (kV/cm) where the slope of D [nm] vs V+ [V] is fitted "
+                         "(default: -10 10)")
+    ap.add_argument("--slope-eapp", default="all", metavar="CONDITION",
+                    help="which loops go in the slope table, by applied field X = E_app "
+                         "(kV/cm): 20 | 10:20 | >=15 | '10:15, 20' | all (default)")
+    ap.add_argument("--interactive", action="store_true",
+                    help="list the E_app values in the files and ask for the slope "
+                         "window and E_app condition")
     args = ap.parse_args(argv)
+    if args.slope_window[0] >= args.slope_window[1]:
+        ap.error("--slope-window: E_LO must be smaller than E_HI")
+    try:
+        args.eapp_test = parse_eapp_condition(args.slope_eapp)
+    except ValueError as e:
+        ap.error(f"--slope-eapp: {e}")
 
-    files = sorted(p for p in args.input_folder.iterdir() if p.suffix.lower() == ".dat")
+    if args.input_folder.is_file():
+        files = [args.input_folder]
+    elif args.input_folder.is_dir():
+        files = sorted(p for p in args.input_folder.iterdir() if p.suffix.lower() == ".dat")
+    else:
+        sys.exit(f"Not found: {args.input_folder}")
     if not files:
         sys.exit(f"No .dat files in {args.input_folder}")
+    if args.interactive:
+        ask_slope_settings(files, args)
+    e_lo, e_hi = args.slope_window
+    print(f"Slope window: {e_lo:g} ... {e_hi:g} kV/cm, E_app condition: {args.slope_eapp}")
     args.output_folder.mkdir(parents=True, exist_ok=True)
     print(f"Processing {len(files)} file(s) -> {args.output_folder}")
 
@@ -572,12 +863,20 @@ def main(argv=None):
     allbroken.to_csv(o / "broken_measurements_all_files.csv", index=False)
     fits = linear_fits(allres)
     fits.to_csv(o / "Sr_ratio_linear_fits.csv", index=False)
+    slopes = allres[args.eapp_test(allres["X_kV_cm"].to_numpy())][SLOPE_COLS]
+    slopes.to_csv(o / "slopes_all_files.csv", index=False)
     if not args.no_plots and len(allres):
         plot_s_vs_x_all_files(allres, o / "S_vs_X_all_files.png")
         plot_sr_ratio(allres, fits, "All files", o / "Sr_ratio_all_files.png")
+        plot_slopes_all_files(slopes, o / "slopes_all_files.png", e_lo, e_hi, args.slope_eapp)
+    n_partial = int((~slopes["slope_window_covered"]).sum())
+    print(f"Slopes: {len(slopes)} loop(s) meet the E_app condition"
+          + (f", {n_partial} of them do not reach {e_lo:g}/{e_hi:g} kV/cm "
+             "(slope_window_covered = False, left out of the plot)" if n_partial else ""))
     try:
         with pd.ExcelWriter(o / "summary_all_files.xlsx") as xw:
             s_vs_x.to_excel(xw, sheet_name="S_vs_X", index=False)
+            slopes.to_excel(xw, sheet_name="slopes", index=False)
             allres.to_excel(xw, sheet_name="all_parameters", index=False)
             fits.to_excel(xw, sheet_name="Sr_ratio_linear_fits", index=False)
             allbroken.to_excel(xw, sheet_name="broken_measurements", index=False)

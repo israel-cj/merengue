@@ -24,7 +24,7 @@ Requires Python 3.8 or newer.
 ## Usage
 
 ```bash
-python pzm_analysis.py  INPUT_FOLDER  OUTPUT_FOLDER  [options]
+python pzm_analysis.py  INPUT_FOLDER_OR_FILE  OUTPUT_FOLDER  [options]
 ```
 
 e.g.
@@ -46,8 +46,13 @@ python pzm_analysis.py "C:\Users\P313565\Py\Hyst\data" "C:\Users\P313565\Py\Hyst
 | `--thickness-um VALUE` | from file | Override the sample thickness (µm) |
 | `--avg-points N` | `0` | Average ±N points around V+max / V−max (noise reduction) |
 | `--no-plots` | off | Write only the CSV/Excel files |
+| `--keep-broken` | off | Keep measurements with `Measurement Status != 0` |
+| `--slope-window E_LO E_HI` | `-10 10` | Field window (kV/cm) where the slope of D [nm] vs V+ [V] is fitted |
+| `--slope-eapp CONDITION` | `all` | Which loops go in the slope table, by applied field E_app (see below) |
+| `--interactive` | off | List the E_app values found in the files, then ask for the window and the condition |
 
-Every `.dat` file in `INPUT_FOLDER` is processed. A table that fails to parse
+Every `.dat` file in `INPUT_FOLDER` is processed. A single `.dat` file can be
+given instead of a folder. A table that fails to parse
 is reported and skipped, and the rest of the run continues.
 
 ---
@@ -92,6 +97,87 @@ Unit conversion uses the thickness stored in each block:
 
 Zero crossings are found by linear interpolation between data points.
 
+### Slope of D [nm] vs V+ [V] in a field window
+
+For every loop, a straight line `D = slope · V + b` is fitted (least squares)
+to the raw `V+ [V]` and `D1 [nm]` columns (or the `--strain-channel` chosen),
+using only the points with `E_LO ≤ E ≤ E_HI` (default −10 … +10 kV/cm). The
+window is given in field and converted to volts with each table's thickness
+(e.g. ±10 kV/cm = ±710 V at 710 µm). The fit is done separately on each half
+of the loop:
+
+| Column | Definition |
+|---|---|
+| `slope_down_nm_per_V` | Decreasing field half‑cycle (V+max → V−max) |
+| `slope_up_nm_per_V` | Increasing field half‑cycle (V−max → V+max) |
+| `slope_mean_nm_per_V` | Mean of the two |
+| `slope_Vlo_V`, `slope_Vhi_V` | The window in volts for that table |
+| `slope_up_R2`, `slope_down_R2`, `slope_*_n` | Fit quality and number of points used |
+| `slope_window_covered` | `False` when the loop does not reach both window edges (E_app smaller than the window). The slope is then fitted over a shorter range. These loops stay in the CSV but are left out of the plot |
+
+1 nm/V = 1000 pm/V. Because the thickness cancels (S/E = D/V), this is the same
+number as the small‑window d33 from the S‑E loop.
+
+At high field, after the sample switches, the increasing‑field half can be far
+from linear inside the window (low R²). Check `*_slope_check.png`, and use the
+`up` / `down` columns separately if the mean is not meaningful.
+
+**Choosing the loops (`--slope-eapp`)**, by applied field E_app in kV/cm
+(matched within ±0.05 kV/cm; parts can be combined with commas):
+
+| Condition | Selects |
+|---|---|
+| `all` | every loop (default) |
+| `20` | E_app = 20 |
+| `10:20` or `10-20` | 10 ≤ E_app ≤ 20 |
+| `>=15`, `>15`, `<=12`, `<12` | comparison |
+| `"10:15, 20"` | 10 ≤ E_app ≤ 15 **or** E_app = 20 |
+
+```bash
+python pzm_analysis.py carpeta_dat carpeta_resultados --slope-window -10 10 --slope-eapp ">=12"
+python pzm_analysis.py carpeta_dat carpeta_resultados --interactive
+python pzm_analysis.py carpeta_dat/PNZT-10P4-7_P120C_35KVcm_5to20.dat carpeta_resultados --slope-window -5 5
+```
+
+### Web interface (Gradio)
+
+```bash
+pip install gradio
+python pzm_gradio.py            # then open http://127.0.0.1:7860
+python pzm_gradio.py --data carpeta_dat --out carpeta_resultados --port 7861
+```
+
+* **Per file** tab: pick a `.dat` from the data folder (or upload one), set the
+  window (kV/cm), the E_app condition and the channel, then press *Compute*.
+  It shows the slope table, the slope‑vs‑E_app plot, and a D‑V check plot for
+  any loop you pick. *Save* writes `<file>_slopes.csv` and
+  `<file>_slope_check.png` for that file only, so each file can keep its own window.
+* **Batch** tab: runs the whole `pzm_analysis.py` pipeline on every file with
+  the settings shown, the same as the command line.
+
+#### Columns of the "Slopes (loops meeting the E_app condition)" table
+
+One row per loop (measurement table) in the file whose E_app meets the
+condition. Broken measurements (status ≠ 0) are left out unless *Keep broken*
+is ticked. Values are rounded to 5 decimals on screen. The saved CSV has full
+precision and a few more columns (file, branch, amplitude, thickness, E at
+V±max, window in kV/cm, status).
+
+| Column | Unit | Meaning |
+|---|---|---|
+| `step` | – | Position of the loop in the measurement sequence of the file (1 = first measured) |
+| `table` | – | Table number in the `.dat` file (same number as in the instrument software). Use it to pick the loop for the check plot |
+| `ramp` | – | `up` if E_app is higher than in the previous loop, `down` if lower, `repeat` if equal |
+| `X_kV_cm` | kV/cm | Applied field E_app = amplitude / thickness. This is what the E_app condition is tested on |
+| `slope_Vlo_V`, `slope_Vhi_V` | V | The field window converted to volts for this loop: E_LO × thickness and E_HI × thickness (e.g. −710 / +710 V for ±10 kV/cm at 710 µm). Only points with V+ in this range are fitted |
+| `slope_window_covered` | True/False | `True` if the loop reaches both window edges. `False` (E_app smaller than the window) means the fit only used the part of the window that the loop reaches. Treat these slopes with care. They are not drawn in the plot |
+| `slope_up_nm_per_V` | nm/V | Slope of the straight line D = slope · V + b fitted on the **increasing‑voltage** half of the loop (V−max → V+max) inside the window |
+| `slope_down_nm_per_V` | nm/V | Same, on the **decreasing‑voltage** half (V+max → V−max) |
+| `slope_mean_nm_per_V` | nm/V | Average of the up and down slopes. This is the value shown in the slope‑vs‑E_app plot. 1 nm/V = 1000 pm/V |
+| `slope_up_R2`, `slope_down_R2` | 0–1 | R² of each fit: how close the loop is to a straight line in the window (1 = perfectly linear). Low values (e.g. < 0.9) mean the half‑cycle is curved there (typical after switching at high field), so its slope and the mean are less meaningful |
+| `slope_up_n`, `slope_down_n` | points | Number of data points used in each fit (points of that half‑cycle inside the window) |
+| `is_last_at_amplitude` | True/False | `False` when the next loop was measured at the same amplitude. Only `True` rows (the last, most stable loop at each amplitude) are used in the plot and in the mean slope shown above the table |
+
 ### Bookkeeping columns
 
 | Column | Meaning |
@@ -108,7 +194,8 @@ Zero crossings are found by linear interpolation between data points.
 ```
 OUTPUT_FOLDER/
 ├── summary_all_files.csv          one row per loop, all files
-├── summary_all_files.xlsx         same + one sheet per file
+├── summary_all_files.xlsx         same + one sheet per file (and a "slopes" sheet)
+├── slopes_all_files.csv / .png    D‑V slope (nm/V) in the field window vs E_app
 └── <file_name>/
     ├── <file>_results.csv              parameters per loop
     ├── <file>_loops.csv                all loop points (long format: table, t, V, E, D, S, P)
@@ -116,7 +203,9 @@ OUTPUT_FOLDER/
     ├── <file>_SE.png                   all S‑E loops, coloured by applied field
     ├── <file>_PE.png                   all P‑E loops, coloured by applied field
     ├── <file>_params_vs_E.png          Smax+, Sr, Smax−, 2Pr, Ec vs applied field
-    └── <file>_annotated_max.png        largest loop with Smax+, Smax−, Sr marked
+    ├── <file>_annotated_max.png        largest loop with Smax+, Smax−, Sr marked
+    ├── <file>_slopes.csv               slope per loop meeting the E_app condition
+    └── <file>_slope_check.png          largest selected loop with the two fitted lines
 ```
 
 Use `*_annotated_max.png` to check visually that the points are picked correctly.
